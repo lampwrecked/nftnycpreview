@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>field</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --ink:#0a0a0a; --paper:#e8e6e1; --dim:#7a786f; --hot:#ffd23f;
+    --tile:240px; --gap:.035;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%;background:var(--ink);color:var(--paper);font:13px/1.4 'Space Mono',ui-monospace,monospace;overflow:hidden;overscroll-behavior:none;-webkit-user-select:none;user-select:none}
+
+  /* ---------- gate ---------- */
+  #gate{position:fixed;inset:0;display:grid;place-items:center;background:var(--ink);z-index:10;transition:opacity .5s ease,visibility .5s}
+  #gate.off{opacity:0;visibility:hidden}
+  #gate form{display:grid;gap:14px;width:min(320px,80vw)}
+  #gate label{font-size:11px;letter-spacing:.18em;text-transform:uppercase;color:var(--dim)}
+  #gate input{width:100%;background:transparent;border:0;border-bottom:1px solid var(--dim);color:var(--paper);font:inherit;font-size:28px;letter-spacing:.4em;padding:6px 0;outline:none;caret-color:var(--hot);transition:border-color .2s}
+  #gate input:focus{border-color:var(--paper)}
+  #gate.no input{border-color:#c0392b;animation:shake .3s}
+  #gate button{justify-self:start;background:none;border:1px solid var(--dim);color:var(--paper);font:inherit;font-size:11px;letter-spacing:.18em;text-transform:uppercase;padding:8px 14px;cursor:pointer}
+  #gate button:hover,#gate button:focus-visible{border-color:var(--hot);color:var(--hot);outline:none}
+  @keyframes shake{25%{transform:translateX(-6px)}75%{transform:translateX(6px)}}
+
+  /* ---------- field ---------- */
+  #stage{position:fixed;inset:0;cursor:grab;touch-action:none}
+  #stage.drag{cursor:grabbing}
+  #world{position:absolute;left:0;top:0;transform-origin:0 0;will-change:transform}
+  .tile{position:absolute;width:var(--tile);height:var(--tile);overflow:hidden;background:#141414;
+        animation:rise .6s cubic-bezier(.2,.8,.2,1) both}
+  .tile img{width:100%;height:100%;object-fit:cover;display:block;opacity:0;transition:opacity .5s ease}
+  .tile img.in{opacity:1}
+  @keyframes rise{from{opacity:0;transform:scale(.86)}to{opacity:1;transform:none}}
+
+  /* ---------- readout ---------- */
+  #hud{position:fixed;left:14px;bottom:12px;font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--dim);pointer-events:none;mix-blend-mode:difference}
+  #hud b{color:var(--paper);font-weight:400}
+  #err{position:fixed;inset:0;display:none;place-items:center;text-align:center;padding:24px;color:var(--dim)}
+  #err.on{display:grid}
+
+  @media (prefers-reduced-motion:reduce){
+    .tile{animation:none}.tile img{transition:none}
+  }
+</style>
+</head>
+<body>
+
+<div id="gate">
+  <form id="gateForm" autocomplete="off">
+    <label for="pw">enter</label>
+    <input id="pw" type="password" inputmode="numeric" autofocus aria-label="password">
+    <button type="submit">open</button>
+  </form>
+</div>
+
+<div id="stage"><div id="world"></div></div>
+<div id="hud"><b id="zoomOut">1.00</b>× · <b id="countOut">0</b> loaded · drag / pinch / scroll</div>
+<div id="err"></div>
+
+<script>
+// ====== CONFIG ============================================================
+const API = 'https://scanner.lampwrecked.workers.dev';  // Worker URL (or its custom domain), no trailing slash
+const PASS_HASH = 'd5330200931a810748a2a665d5c597676cf92ff5585d9a0287923affd27369bb'; // sha-256 of the password
+const TILE = 240;                      // world units per cell (matches --tile)
+const GAP  = 0.035;                    // fraction of a cell left empty
+const ZMIN = 0.12, ZMAX = 3.2;         // zoom range
+const MARGIN = 1;                      // extra cells rendered past the viewport edge
+// =========================================================================
+
+const $ = s => document.querySelector(s);
+const gate = $('#gate'), stage = $('#stage'), world = $('#world');
+const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+let keys = [];
+const seed = (Math.random() * 2 ** 32) >>> 0;   // fresh random order every visit
+
+// ---------- gate ----------
+async function sha256(s) {
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s));
+  return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('');
+}
+$('#gateForm').addEventListener('submit', async e => {
+  e.preventDefault();
+  if (await sha256($('#pw').value.trim()) === PASS_HASH) {
+    sessionStorage.setItem('fieldOpen', '1');
+    enter();
+  } else {
+    gate.classList.remove('no'); void gate.offsetWidth; gate.classList.add('no');
+    $('#pw').value = ''; $('#pw').focus();
+  }
+});
+
+async function enter() {
+  const err = $('#err');
+  try {
+    const r = await fetch(`${API}/list`, { cache: 'no-store' });
+    if (!r.ok) throw new Error(r.status);
+    keys = (await r.json()).keys;
+  } catch (x) {
+    gate.classList.add('off');
+    err.textContent = `Couldn't reach the bucket (${x.message}). Check the API address at the top of the script.`;
+    err.classList.add('on'); return;
+  }
+  gate.classList.add('off');
+  if (!keys.length) { err.textContent = 'The bucket has no images yet. Upload some and reload.'; err.classList.add('on'); return; }
+  start();
+}
+if (sessionStorage.getItem('fieldOpen')) enter();
+
+// ---------- camera ----------
+// screen = (world - c) * z + viewport/2 ; we lerp toward the target each frame → the "liquid" feel
+const cam = { cx: 0, cy: 0, z: 1 };
+const tgt = { cx: 0, cy: 0, z: 1 };
+let vx = 0, vy = 0;                     // pan velocity for momentum
+const tiles = new Map();                // "col,row" → element
+
+function hash(col, row) {               // stable random per cell, per session
+  let h = (col * 0x9E3779B1) ^ (row * 0x85EBCA77) ^ seed;
+  h = Math.imul(h ^ (h >>> 15), 0x2C1B3C6D);
+  h = Math.imul(h ^ (h >>> 12), 0x297A2D39);
+  return (h ^ (h >>> 15)) >>> 0;
+}
+
+function makeTile(col, row) {
+  const el = document.createElement('div');
+  el.className = 'tile';
+  const pad = TILE * GAP / 2;
+  el.style.left = `${col * TILE + pad}px`; el.style.top = `${row * TILE + pad}px`;
+  el.style.width = el.style.height = `${TILE * (1 - GAP)}px`;
+  const img = new Image();
+  img.decoding = 'async'; img.loading = 'lazy'; img.draggable = false;
+  img.onload = () => { img.classList.add('in'); count++; hudCount.textContent = count; };
+  img.src = `${API}/img/${keys[hash(col, row) % keys.length].split('/').map(encodeURIComponent).join('/')}`;
+  el.appendChild(img);
+  return el;
+}
+
+let count = 0;
+const hudCount = $('#countOut'), hudZoom = $('#zoomOut');
+
+function cull() {
+  const vw = innerWidth, vh = innerHeight;
+  const halfW = vw / (2 * cam.z), halfH = vh / (2 * cam.z);
+  const c0 = Math.floor((cam.cx - halfW) / TILE) - MARGIN, c1 = Math.ceil((cam.cx + halfW) / TILE) + MARGIN;
+  const r0 = Math.floor((cam.cy - halfH) / TILE) - MARGIN, r1 = Math.ceil((cam.cy + halfH) / TILE) + MARGIN;
+  const keep = new Set();
+  for (let r = r0; r <= r1; r++) for (let c = c0; c <= c1; c++) {
+    const k = c + ',' + r; keep.add(k);
+    if (!tiles.has(k)) { const el = makeTile(c, r); tiles.set(k, el); world.appendChild(el); }
+  }
+  for (const [k, el] of tiles) if (!keep.has(k)) { el.remove(); tiles.delete(k); }
+}
+
+function frame() {
+  const ease = reduced ? 1 : 0.18;
+  // momentum
+  if (!dragging) { tgt.cx += vx; tgt.cy += vy; vx *= 0.92; vy *= 0.92; if (Math.abs(vx) + Math.abs(vy) < 0.02) vx = vy = 0; }
+  cam.cx += (tgt.cx - cam.cx) * ease;
+  cam.cy += (tgt.cy - cam.cy) * ease;
+  cam.z  += (tgt.z  - cam.z ) * ease;
+  world.style.transform = `translate(${innerWidth / 2 - cam.cx * cam.z}px, ${innerHeight / 2 - cam.cy * cam.z}px) scale(${cam.z})`;
+  hudZoom.textContent = cam.z.toFixed(2);
+  cull();
+  requestAnimationFrame(frame);
+}
+
+// ---------- input ----------
+const ptrs = new Map();
+let dragging = false, last = null, pinch = null;
+
+function zoomAt(sx, sy, factor) {
+  const nz = Math.min(ZMAX, Math.max(ZMIN, tgt.z * factor));
+  // keep the world point under the pointer fixed
+  const wx = (sx - innerWidth / 2) / tgt.z + tgt.cx, wy = (sy - innerHeight / 2) / tgt.z + tgt.cy;
+  tgt.cx = wx - (sx - innerWidth / 2) / nz;
+  tgt.cy = wy - (sy - innerHeight / 2) / nz;
+  tgt.z = nz;
+}
+
+stage.addEventListener('pointerdown', e => {
+  stage.setPointerCapture(e.pointerId);
+  ptrs.set(e.pointerId, { x: e.clientX, y: e.clientY });
+  if (ptrs.size === 1) { dragging = true; last = { x: e.clientX, y: e.clientY, t: performance.now() }; vx = vy = 0; stage.classList.add('drag'); }
+  if (ptrs.size === 2) {
+    const [a, b] = [...ptrs.values()];
+    pinch = { d: Math.hypot(a.x - b.x, a.y - b.y), z: tgt.z };
+  }
+});
+stage.addEventListener('pointermove', e => {
+  if (!ptrs.has(e.pointerId)) return;
+  ptrs.set(e.pointerId, { x: e.clientX, y: e.clientY });
+  if (ptrs.size === 2 && pinch) {
+    const [a, b] = [...ptrs.values()];
+    const d = Math.hypot(a.x - b.x, a.y - b.y);
+    const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+    zoomAt(mid.x, mid.y, (pinch.z * d / pinch.d) / tgt.z);
+    return;
+  }
+  if (dragging && last) {
+    const dx = e.clientX - last.x, dy = e.clientY - last.y;
+    tgt.cx -= dx / tgt.z; tgt.cy -= dy / tgt.z;
+    const now = performance.now(), dt = Math.max(1, now - last.t);
+    vx = -(dx / tgt.z) / dt * 16; vy = -(dy / tgt.z) / dt * 16;
+    last = { x: e.clientX, y: e.clientY, t: now };
+  }
+});
+const up = e => {
+  ptrs.delete(e.pointerId);
+  if (ptrs.size < 2) pinch = null;
+  if (ptrs.size === 0) { dragging = false; last = null; stage.classList.remove('drag'); }
+  else if (ptrs.size === 1) { const p = [...ptrs.values()][0]; last = { x: p.x, y: p.y, t: performance.now() }; vx = vy = 0; }
+};
+stage.addEventListener('pointerup', up);
+stage.addEventListener('pointercancel', up);
+
+stage.addEventListener('wheel', e => {
+  e.preventDefault();
+  if (e.ctrlKey || e.metaKey) zoomAt(e.clientX, e.clientY, Math.exp(-e.deltaY * 0.01));   // trackpad pinch
+  else { tgt.cx += e.deltaX / tgt.z; tgt.cy += e.deltaY / tgt.z; }                       // scroll = pan
+}, { passive: false });
+
+addEventListener('keydown', e => {
+  if (e.key === '=' || e.key === '+') zoomAt(innerWidth / 2, innerHeight / 2, 1.25);
+  if (e.key === '-') zoomAt(innerWidth / 2, innerHeight / 2, 0.8);
+  const step = 80 / tgt.z;
+  if (e.key === 'ArrowLeft') tgt.cx -= step; if (e.key === 'ArrowRight') tgt.cx += step;
+  if (e.key === 'ArrowUp') tgt.cy -= step;   if (e.key === 'ArrowDown') tgt.cy += step;
+});
+
+function start() {
+  // land somewhere random so every visit opens on a different patch
+  tgt.cx = cam.cx = (Math.random() - 0.5) * 4000;
+  tgt.cy = cam.cy = (Math.random() - 0.5) * 4000;
+  requestAnimationFrame(frame);
+}
+</script>
+</body>
+</html>
